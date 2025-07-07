@@ -109,7 +109,7 @@ def load_checkpoint(checkpoint, model, optimizer=None, scheduler=None):
     """
     if not os.path.exists(checkpoint):
         raise RuntimeError(f"File doesn't exist {checkpoint}")
-    checkpoint = torch.load(checkpoint)
+    checkpoint = torch.load(checkpoint, weights_only=False)
     model.load_state_dict(checkpoint['state_dict'])
 
     if optimizer:
