@@ -558,15 +558,11 @@ class SYSNetSnapshot(SYSNet):
         return testloss_ensemble, hpix_, torch.cat(pred_ensemble, 1)
 
 def worker(dataloaders, nn_structure, seed, send_end,
-           config, checkpoint_path, lossfig_path, t0):
+           Model, Optim, Scheduler, Loss, config,
+           checkpoint_path, lossfig_path, t0):
     # setting the number of threads makes results slightly different,
     # https://github.com/pytorch/pytorch/issues/88718
     #torch.set_num_threads(nthreads)
-    # re-initialize loss, model, optimizer for each chain
-    Loss, config.loss_kwargs = src.init_loss(config.loss)
-    Model = src.init_model(config.model)
-    Optim, config.optim_kwargs = src.init_optim(config.optim)
-    Scheduler, config.scheduler_kwargs = src.init_scheduler(config)
     train_val_losses = src.train_for_multiprocessing(dataloaders, nn_structure, seed,
                                                      Model, Optim, Scheduler, Loss, config,
                                                      checkpoint_path, lossfig_path, t0)
@@ -714,7 +710,8 @@ class SYSNetMPI(SYSNet):
             lossfig_path = self.lossfig_path_fn(partition_id, seed)
             process = torch.multiprocessing.Process(target=worker, 
                                                     args=(dataloaders, nn_structure, seed, send_end,
-                                                          self.config, checkpoint_path, lossfig_path, self.t0))
+                                                          self.Model, self.Optim, self.Scheduler, self.Loss, self.config,
+                                                          checkpoint_path, lossfig_path, self.t0))
             processes.append(process)
             pipe_list.append(recv_end)
             process.start()
@@ -744,6 +741,49 @@ class SYSNetMPI(SYSNet):
 
         if not self.config.no_eval:
             self.collector.finish(base_losses, hpix)
+
+class SYSNetSnapshotMPI(SYSNetMPI):
+    def __init__(self, *arrays, **kwargs):
+        super(SYSNetSnapshotMPI, self).__init__(*arrays, **kwargs)
+    
+    def evaluate(self, dataloader, nn_structure, restore_path):
+        """
+        Evaluates an ensemble trained neural network on the test set
+
+        parameters
+        ----------
+        dataloader :
+        nn_structure : (tuple of int)
+            i.e., (# layers, # units, # features, 1)
+        restore_path : (str)
+            path to the file to restore the weights from
+
+
+        returns
+        -------
+        predictions : (test loss, hpix, pred)
+            test loss
+            healpix pixel indices
+            predicted number of galaxies in the pixel
+
+        see also
+        --------
+        1. https://pytorch.org/tutorials/beginner/saving_loading_models.html
+        """
+        snapshot_path = os.path.dirname(restore_path)
+        snapshots = glob(os.path.join(snapshot_path, 'snapshot_*.pth.tar'))
+        
+        self.logger.info(f"Restoring parameters from {len(snapshots)} snapshots")
+        if len(snapshots) == 0:sys.exit(f'Something is wrong. there is no snapshots.')
+        
+        pred_ensemble = []
+        testloss_ensemble = []
+        for snapshot_i in snapshots:
+            test_loss_, hpix_, pred_ = super(SYSNetSnapshot, self).evaluate(dataloader, nn_structure, snapshot_i)
+            pred_ensemble.append(pred_)
+            testloss_ensemble.append(test_loss_)
+            
+        return testloss_ensemble, hpix_, torch.cat(pred_ensemble, 1)
         
 class TrainedModel:
     

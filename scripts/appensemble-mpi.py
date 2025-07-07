@@ -6,7 +6,7 @@
     to learn about the input parameters.
     
     Mehdi Rezaie, mr095415@ohio.edu
-    October 2020
+    December 2020
 """
 import sysnet
 
@@ -16,5 +16,6 @@ if __name__ == '__main__':
         sysnet.detect_anomaly() # this will slow down
 
     config = sysnet.parse_cmd_arguments('config.yaml')
-    pipeline = sysnet.SYSNetMultiProcess(config)
+    pipeline = sysnet.SYSNetSnapshotMPI(config)
+    pipeline.config.scheduler_kwargs.update(T_0=5, T_mult=1)  # FIXME: it does not show up in the log!
     pipeline.run()
