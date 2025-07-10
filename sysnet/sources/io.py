@@ -198,9 +198,12 @@ class SYSNetCollector:
         metrics_dir = os.path.dirname(metrics_path)
         if not os.path.exists(metrics_dir):
             os.makedirs(metrics_dir)
-        
-        pred = [collector.pred[0] for collector in collectors]
-        hpix = [collector.hpix[0] for collector in collectors]
+    
+        if isinstance(collectors[0],SYSNetCollector):
+            pred = [collector.pred[0] for collector in collectors]
+            hpix = [collector.hpix[0] for collector in collectors]
+        else:
+            hpix, pred = collectors
         pred = torch.cat(pred, 0).cpu().numpy()
         hpix = torch.cat(hpix, 0).numpy()
         weights = np.zeros(pred.shape[0], dtype=[

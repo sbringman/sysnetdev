@@ -557,21 +557,9 @@ class SYSNetSnapshot(SYSNet):
             
         return testloss_ensemble, hpix_, torch.cat(pred_ensemble, 1)
 
-def worker(dataloaders, nn_structure, seed, send_end,
-           Model, Optim, Scheduler, Loss, config,
-           checkpoint_path, lossfig_path, t0):
-    # setting the number of threads makes results slightly different,
-    # https://github.com/pytorch/pytorch/issues/88718
-    #torch.set_num_threads(nthreads)
-    train_val_losses = src.train_for_multiprocessing(dataloaders, nn_structure, seed,
-                                                     Model, Optim, Scheduler, Loss, config,
-                                                     checkpoint_path, lossfig_path, t0)
-    send_end.send(train_val_losses)
-    
 class SYSNetMPI(SYSNet):
     """
-    SYSNetMPI: An MPI-enabled version of SYSNet to parallelize training across partitions.
-    Furthermore, use multiprocesses to parallelize training across chains within partitions.
+    SYSNetMPI: An MPI-enabled version of SYSNet to parallelize training across partitions and chains.
     TODO: Need to fix logging behavior. Right now only rank 0 displays and logs information,
     otherwise all ranks will compete for writing to the log file.
     """
@@ -639,8 +627,8 @@ class SYSNetMPI(SYSNet):
             
     def run(self):
         """
-        Run SYSNet with partition-level parallelization using MPI.
-        Each rank handles one partition.
+        Run SYSNet with parallelization using MPI.
+        Each rank handles a chain.
         """
         if self.config.do_rfe:
             if self.rank == self.mpiroot:
@@ -648,98 +636,84 @@ class SYSNetMPI(SYSNet):
             self.axes_from_rfe = self.mpicomm.bcast(getattr(self, 'axes_from_rfe', None), root=self.mpiroot)
             sys.exit('rfe done...rerun the code without --do_rfe')
 
-        self.logger.info(f'# [Rank {self.rank}] Starting partition-level MPI pipeline')
+        if self.rank == self.mpiroot:
+            self.logger.info(f'# [Rank {self.rank}] Starting partition-level MPI pipeline')
 
         num_partitions = 5 if self.config.do_kfold else 1
+        total_required_ranks = num_partitions * self.config.nchains
 
-        if self.size > num_partitions:
-            if self.rank == self.mpiroot:
-                self.logger.warning(f'More MPI ranks ({self.size}) than partitions ({num_partitions}). Some ranks will idle.')
+        if self.size != total_required_ranks and self.rank == self.mpiroot:
+            self.logger.warning(f"Expected {total_required_ranks} MPI ranks for {num_partitions} partitions and {self.config.nchains} chains, but got {self.size}")
 
-        if self.rank < num_partitions:
-            # Each rank handles one partition
-            partition_id = self.rank
-            axes = self.axes_for_partition(partition_id)
-            nn_structure = self.get_structure(len(axes))
+        if self.rank >= total_required_ranks:
+            self.logger.info(f'[Rank {self.rank}] Idle: not used for training. {self.rank}/{total_required_ranks}')
+            return
 
-            if self.rank == self.mpiroot:
-                self.logger.info(f'[Rank {self.rank}] Processing partition {partition_id} with structure {nn_structure}')
+        partition_id = self.rank // self.config.nchains
+        chain_id = self.rank % self.config.nchains
 
-            dataloaders = self.ld.load_data(batch_size=self.config.batch_size,
-                                            partition_id=partition_id,
-                                            normalization=self.config.normalization,
-                                            axes=axes)
+        axes = self.axes_for_partition(partition_id)
+        nn_structure = self.get_structure(len(axes))
 
-            self.tune_hyperparams(dataloaders, nn_structure, partition_id)
-            self.train_and_eval_chains(dataloaders, nn_structure, partition_id)
+        if self.rank == self.mpiroot:
+            self.logger.info(f'[Rank {self.rank}] Processing partition {partition_id}, chain {chain_id}, structure {nn_structure}')
 
+        dataloaders = self.ld.load_data(batch_size=self.config.batch_size,
+                                        partition_id=partition_id,
+                                        normalization=self.config.normalization,
+                                        axes=axes)
+
+        self.tune_hyperparams(dataloaders, nn_structure, partition_id)
+        self.train_and_eval_chains(dataloaders, nn_structure, partition_id, chain_id)
+        temp_collector = {f'{partition_id}_{chain_id}': self.collector} # label collectors
         self.mpicomm.Barrier()
-        self.collectors = self.mpicomm.gather(self.collector, root=self.mpiroot)
+        
+        self.collectors = self.mpicomm.gather(temp_collector, root=self.mpiroot)
         
         if not self.config.no_eval and self.rank == self.mpiroot:
             self.logger.info(f'finished training in {time()-self.t0:.3f} sec')
             self.logger.info(f'wrote weights: {self.weights_path}')
-            self.logger.info(f'wrote weights: {self.weights_path}')
-            self.collector.save_collectors(self.collectors, self.weights_path, self.metrics_path)
+            
+            collectors_dict = {}
+            for dicti in self.collectors: collectors_dict.update(dicti)
+
+            hpix,pred = [],[]
+            for pid in range(num_partitions):
+                pred_list = [] 
+                for chid in range(self.config.nchains):
+                    collector = collectors_dict[f'{pid}_{chid}']
+                    pred_list.append(collector.pred[0])
+                hpix.append(collector.hpix[0])
+                pred.append(torch.cat(pred_list, 1))
+               
+            self.collector.save_collectors([hpix,pred], self.weights_path, self.metrics_path)
             if self.config.do_tar:
                 self.tar_models(self.config.output_path)
     
-    def train_and_eval_chains(self, dataloaders, nn_structure, partition_id):
-        '''
-        Train and evaluate for 'nchain' times (using multiprocessing)
-        '''
+    def train_and_eval_chains(self, dataloaders, nn_structure, partition_id, chain_id):
+        """
+        Train and evaluate a single chain using one MPI rank.
+        """
         np.random.seed(__global_seed__)
         seeds = np.random.randint(0, __seed_max__, size=self.config.nchains)
+        seed = seeds[chain_id] + 1000
 
         self.collector.start()
         base_losses = self.get_base_losses(dataloaders)
-        
-        # Using multiprocess
-        nproc = self.config.nchains
-        #resource_count = torch.multiprocessing.cpu_count() - 1
-        #nthreads = floor(resource_count/nproc)
-        #torch.set_num_threads(resource_count)
 
-        processes = []
-        pipe_list = []
-        torch.multiprocessing.set_start_method('spawn', force=True)
-        for chain_id in range(nproc):
-            seed = seeds[chain_id] + 1000
-            recv_end, send_end = torch.multiprocessing.Pipe(False)
-            checkpoint_path = self.checkpoint_path_fn(partition_id, seed)
-            lossfig_path = self.lossfig_path_fn(partition_id, seed)
-            process = torch.multiprocessing.Process(target=worker, 
-                                                    args=(dataloaders, nn_structure, seed, send_end,
-                                                          self.Model, self.Optim, self.Scheduler, self.Loss, self.config,
-                                                          checkpoint_path, lossfig_path, self.t0))
-            processes.append(process)
-            pipe_list.append(recv_end)
-            process.start()
-        for process in processes:
-            process.join()
-        train_val_losses_list = [res.recv() for res in pipe_list]
-        self.logger.info(f'[Rank {self.rank}] finished training all models that follow pattern model_{partition_id}_* in {time()-self.t0:.3f} sec')
-        
-        for chain_id in range(self.config.nchains):
-
-            seed = seeds[chain_id] + 1000
-
-            if not self.config.no_eval:
-
-                restore_path = self.restore_path_fn(partition_id, seed)
-                test_loss, hpix, pred_ = self.evaluate(dataloaders['test'], nn_structure, restore_path)
-                
-                #train_val_losses = torch.load(restore_path)['best_val_loss']
-                train_val_losses = train_val_losses_list[chain_id]
-                
-                if isinstance(test_loss, list):                
-                    self.logger.info(f'[Rank {self.rank}] best val loss: {train_val_losses[0]:.6f}, (mean) test loss: {np.mean(test_loss):.6f}, seed: {seed}')
-                else:
-                    self.logger.info(f'[Rank {self.rank}] best val loss: {train_val_losses[0]:.6f}, test loss: {test_loss:.6f}, seed: {seed}')
-                    
-                self.collector.collect_chain(train_val_losses, test_loss, pred_)
+        self.logger.info(f'[Rank {self.rank}] Training with seed {seed} for partition {partition_id}, chain {chain_id}')
+        train_val_losses = self.train(dataloaders, nn_structure, seed, partition_id)
 
         if not self.config.no_eval:
+            restore_path = self.restore_path_fn(partition_id, seed)
+            test_loss, hpix, pred_ = self.evaluate(dataloaders['test'], nn_structure, restore_path)
+
+            if isinstance(test_loss, list):                
+                self.logger.info(f'[Rank {self.rank}] best val loss: {train_val_losses[0]:.6f}, (mean) test loss: {np.mean(test_loss):.6f}')
+            else:
+                self.logger.info(f'[Rank {self.rank}] best val loss: {train_val_losses[0]:.6f}, test loss: {test_loss:.6f}')
+
+            self.collector.collect_chain(train_val_losses, test_loss, pred_)
             self.collector.finish(base_losses, hpix)
 
 class SYSNetSnapshotMPI(SYSNetMPI):
