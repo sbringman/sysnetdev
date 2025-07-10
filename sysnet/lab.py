@@ -29,7 +29,6 @@ __global_seed__ = 85
 __nepochs_hyperparams__ = 50
 __seed_max__ = 4294967295  # i.e., 2**32 - 1, maximum number in numpy
 
-
 class SYSNet:
     """
     A multilayer fully connected neural network pipeline for systematics modeling
@@ -577,15 +576,7 @@ class SYSNetMPI(SYSNet):
         log_path = os.path.join(self.config.output_path, 'train.log')
         if self.rank == self.mpiroot:
             src.set_logger(log_path, level=__logger_level__)
-            self.logger.info(f"logging in {log_path}")
-
-        # initialize loss, collectors, model, optimizor
-        self.Loss, self.config.loss_kwargs = src.init_loss(self.config.loss)
-        self.collector = src.SYSNetCollector()
-        self.Model = src.init_model(self.config.model)
-        self.Optim, self.config.optim_kwargs = src.init_optim(self.config.optim)
-        self.Scheduler, self.config.scheduler_kwargs = src.init_scheduler(self.config)
-        
+            self.logger.info(f"logging in {log_path}")        
         
         self.config.device = src.get_device() # set the device
         if self.rank == self.mpiroot:
@@ -640,34 +631,38 @@ class SYSNetMPI(SYSNet):
             self.logger.info(f'# [Rank {self.rank}] Starting partition-level MPI pipeline')
 
         num_partitions = 5 if self.config.do_kfold else 1
-        total_required_ranks = num_partitions * self.config.nchains
-
-        if self.size != total_required_ranks and self.rank == self.mpiroot:
-            self.logger.warning(f"Expected {total_required_ranks} MPI ranks for {num_partitions} partitions and {self.config.nchains} chains, but got {self.size}")
-
-        if self.rank >= total_required_ranks:
-            self.logger.info(f'[Rank {self.rank}] Idle: not used for training. {self.rank}/{total_required_ranks}')
-            return
-
-        partition_id = self.rank // self.config.nchains
-        chain_id = self.rank % self.config.nchains
-
-        axes = self.axes_for_partition(partition_id)
-        nn_structure = self.get_structure(len(axes))
-
+        tasks_list = np.arange(num_partitions * self.config.nchains)
+        start,stop = src.split_NtoM(len(tasks_list),self.size,self.rank) # distribute chunks of tasks across ranks using chunks
         if self.rank == self.mpiroot:
-            self.logger.info(f'[Rank {self.rank}] Processing partition {partition_id}, chain {chain_id}, structure {nn_structure}')
+            self.logger.info(f'[Rank {self.rank}] Working on tasks {tasks_list[start:stop+1]}')
+        temp_collector = {}
+        for taski in tasks_list[start:stop+1]:
+            partition_id = taski // self.config.nchains
+            chain_id = taski % self.config.nchains
+    
+            axes = self.axes_for_partition(partition_id)
+            nn_structure = self.get_structure(len(axes))
 
-        dataloaders = self.ld.load_data(batch_size=self.config.batch_size,
-                                        partition_id=partition_id,
-                                        normalization=self.config.normalization,
-                                        axes=axes)
-
-        self.tune_hyperparams(dataloaders, nn_structure, partition_id)
-        self.train_and_eval_chains(dataloaders, nn_structure, partition_id, chain_id)
-        temp_collector = {f'{partition_id}_{chain_id}': self.collector} # label collectors
-        self.mpicomm.Barrier()
+            # initialize loss, collectors, model, optimizor
+            self.Loss, self.config.loss_kwargs = src.init_loss(self.config.loss)
+            self.collector = src.SYSNetCollector()
+            self.Model = src.init_model(self.config.model)
+            self.Optim, self.config.optim_kwargs = src.init_optim(self.config.optim)
+            self.Scheduler, self.config.scheduler_kwargs = src.init_scheduler(self.config)
+            
+            if self.rank == self.mpiroot:
+                self.logger.info(f'[Rank {self.rank}] Processing partition {partition_id}, chain {chain_id}, structure {nn_structure}')
+    
+            dataloaders = self.ld.load_data(batch_size=self.config.batch_size,
+                                            partition_id=partition_id,
+                                            normalization=self.config.normalization,
+                                            axes=axes)
+    
+            self.tune_hyperparams(dataloaders, nn_structure, partition_id)
+            self.train_and_eval_chains(dataloaders, nn_structure, partition_id, chain_id)
+            temp_collector.update({f'{partition_id}_{chain_id}': self.collector}) # label collectors
         
+        self.mpicomm.Barrier()
         self.collectors = self.mpicomm.gather(temp_collector, root=self.mpiroot)
         
         if not self.config.no_eval and self.rank == self.mpiroot:

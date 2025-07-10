@@ -42,3 +42,21 @@ def set_logger(log_path=None, level='info'):
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(logging.Formatter('%(message)s'))
         logger.addHandler(stream_handler)
+
+def split_NtoM(N, M, rank):
+    """
+    split N to M pieces
+    
+    see https://stackoverflow.com/a/26554699/9746916
+    """
+    chunk = N // M
+    remainder = N % M
+    
+    if rank < remainder:
+        start = rank * (chunk + 1)
+        stop = start + chunk
+    else:
+        start = rank * chunk + remainder
+        stop = start + (chunk -1)
+    
+    return start, stop

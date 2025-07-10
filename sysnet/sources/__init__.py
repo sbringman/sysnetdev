@@ -7,5 +7,5 @@ from .train import (tune_model_structure, train_and_eval,
                    init_optim, init_scheduler, get_device, forward)
 from .trainmp import (train_for_multiprocessing)
 from .feature_elimination import FeatureElimination
-from .utils import set_logger
+from .utils import set_logger, split_NtoM
 from .losses import init_loss
