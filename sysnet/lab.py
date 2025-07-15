@@ -576,7 +576,13 @@ class SYSNetMPI(SYSNet):
         log_path = os.path.join(self.config.output_path, 'train.log')
         if self.rank == self.mpiroot:
             src.set_logger(log_path, level=__logger_level__)
-            self.logger.info(f"logging in {log_path}")        
+            self.logger.info(f"logging in {log_path}")  
+
+        # initialize loss, model, optimizor
+        self.Loss, self.config.loss_kwargs = src.init_loss(self.config.loss)
+        self.Model = src.init_model(self.config.model)
+        self.Optim, self.config.optim_kwargs = src.init_optim(self.config.optim)
+        self.Scheduler, self.config.scheduler_kwargs = src.init_scheduler(self.config)
         
         self.config.device = src.get_device() # set the device
         if self.rank == self.mpiroot:
@@ -643,12 +649,8 @@ class SYSNetMPI(SYSNet):
             axes = self.axes_for_partition(partition_id)
             nn_structure = self.get_structure(len(axes))
 
-            # initialize loss, collectors, model, optimizor
-            self.Loss, self.config.loss_kwargs = src.init_loss(self.config.loss)
+            # initialize collectors
             self.collector = src.SYSNetCollector()
-            self.Model = src.init_model(self.config.model)
-            self.Optim, self.config.optim_kwargs = src.init_optim(self.config.optim)
-            self.Scheduler, self.config.scheduler_kwargs = src.init_scheduler(self.config)
             
             if self.rank == self.mpiroot:
                 self.logger.info(f'[Rank {self.rank}] Processing partition {partition_id}, chain {chain_id}, structure {nn_structure}')
